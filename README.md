@@ -51,7 +51,7 @@ You only need to install the backends you plan to use.
 **Codex (plugin):**
 
 ```sh
-codex plugin marketplace add shinpr/sub-agents-skills
+codex plugin marketplace add HerbertGao/sub-agents-skills
 ```
 
 Then open the plugin picker, install `Runner`, and restart Codex:
@@ -65,7 +65,7 @@ After restart, invoke the skill as `$runner:sub-agents`.
 **Claude Code (plugin):**
 
 ```text
-/plugin marketplace add shinpr/sub-agents-skills
+/plugin marketplace add HerbertGao/sub-agents-skills
 /plugin install runner@sub-agents-skills
 /reload-plugins
 ```
@@ -76,19 +76,19 @@ Use the install script to copy the skill into the client's skill path:
 
 ```bash
 # Cursor
-curl -fsSL https://raw.githubusercontent.com/shinpr/sub-agents-skills/main/install.sh | bash -s -- --target ~/.cursor/skills
+curl -fsSL https://raw.githubusercontent.com/HerbertGao/sub-agents-skills/main/install.sh | bash -s -- --target ~/.cursor/skills
 
 # Gemini
-curl -fsSL https://raw.githubusercontent.com/shinpr/sub-agents-skills/main/install.sh | bash -s -- --target ~/.gemini/skills
+curl -fsSL https://raw.githubusercontent.com/HerbertGao/sub-agents-skills/main/install.sh | bash -s -- --target ~/.gemini/skills
 
 # VS Code / Copilot (project-scoped)
-curl -fsSL https://raw.githubusercontent.com/shinpr/sub-agents-skills/main/install.sh | bash -s -- --target .github/skills
+curl -fsSL https://raw.githubusercontent.com/HerbertGao/sub-agents-skills/main/install.sh | bash -s -- --target .github/skills
 ```
 
 Or clone manually:
 
 ```bash
-git clone https://github.com/shinpr/sub-agents-skills.git
+git clone https://github.com/HerbertGao/sub-agents-skills.git
 cd sub-agents-skills
 ./install.sh --target <client-skill-path>
 ```

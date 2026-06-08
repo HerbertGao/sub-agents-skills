@@ -2,11 +2,11 @@
 set -e
 
 # sub-agents-skills installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/shinpr/sub-agents-skills/main/install.sh | bash -s -- --target <path>
+# Usage: curl -fsSL https://raw.githubusercontent.com/HerbertGao/sub-agents-skills/main/install.sh | bash -s -- --target <path>
 
 TARGET=""
 SKILL_NAME=""
-REPO_URL="https://github.com/shinpr/sub-agents-skills"
+REPO_URL="https://github.com/HerbertGao/sub-agents-skills"
 
 usage() {
     echo "Usage: $0 --target <install-path> [--skill <skill-name>]"
