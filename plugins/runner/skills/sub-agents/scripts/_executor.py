@@ -5,13 +5,20 @@ from __future__ import annotations
 import os
 import queue
 import subprocess
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 from _builder import AgentInvocation, build_invocation_args
 from _stream import StreamProcessor
 
 _SUCCESS_EXIT_CODES = (0, 143, -15)  # 0 ok, 143/-15 = SIGTERM (we asked it to stop)
+
+# Exit code for a failed environment preflight (config dir not writable etc.).
+# 126 = "command found but not executable / permission problem" by convention;
+# distinct from 127 (not found) and 124 (timeout) so callers can branch on it.
+_PREFLIGHT_EXIT_CODE = 126
 
 
 def _partial_response(cli: str, result: dict | None, exit_code: int, error: str) -> dict:
@@ -25,15 +32,59 @@ def _partial_response(cli: str, result: dict | None, exit_code: int, error: str)
 
 
 def _error_response(
-    cli: str, exit_code: int, error: str, partial_result: dict | None = None
+    cli: str,
+    exit_code: int,
+    error: str,
+    partial_result: dict | None = None,
+    root_cause: str | None = None,
 ) -> dict:
-    return {
+    response = {
         "result": partial_result.get("result", "") if partial_result else "",
         "exit_code": exit_code,
         "status": "error",
         "cli": cli,
         "error": error,
     }
+    if root_cause:
+        response["root_cause"] = root_cause
+    return response
+
+
+def _summarize_stderr(stderr: str) -> tuple[str, str | None]:
+    """Collapse repeated stderr lines and extract the terminal error.
+
+    Sub-agent CLIs can spew many identical diagnostic lines (e.g. cursor-agent
+    repeats ``failed to copy trust settings of system certificate`` ~18×) and
+    bury the one actionable line (``EPERM ... cli-config.json.tmp``) at the very
+    end. Runs of consecutive duplicate lines are collapsed with a ``(×N)``
+    count, and the last error-shaped line is surfaced as the root cause so
+    callers can branch on the real failure instead of parsing the noise.
+
+    Returns ``(deduped_text, root_cause_or_None)``.
+    """
+    lines = [ln for ln in (stderr or "").splitlines() if ln.strip()]
+    if not lines:
+        return "", None
+
+    # Collapse consecutive duplicates, annotating the repeat count.
+    collapsed: list[list] = []
+    for ln in lines:
+        if collapsed and collapsed[-1][0] == ln:
+            collapsed[-1][1] += 1
+        else:
+            collapsed.append([ln, 1])
+    deduped = "\n".join(
+        f"{text} (×{count})" if count > 1 else text for text, count in collapsed
+    )
+
+    # Root cause: the last line that looks like a terminal error, falling back
+    # to the final line when nothing matches the error-shaped heuristics.
+    _ERROR_MARKERS = ("error", "eperm", "eacces", "permission denied", "fatal")
+    root_cause = next(
+        (text for text, _ in reversed(collapsed) if any(m in text.lower() for m in _ERROR_MARKERS)),
+        collapsed[-1][0],
+    )
+    return deduped, root_cause
 
 
 def build_final_response(
@@ -72,8 +123,15 @@ def build_final_response(
     }
     if status == "error":
         msg = f"CLI exited with code {exit_code}"
-        if stderr and stderr.strip():
-            msg += f": {stderr.strip()}"
+        deduped, root_cause = _summarize_stderr(stderr or "")
+        if root_cause:
+            # Lead with the actionable cause instead of burying it under
+            # repeated diagnostic spam.
+            msg += f": {root_cause}"
+            response["root_cause"] = root_cause
+        if deduped and deduped != root_cause:
+            # Keep the full (deduped) stderr available for debugging.
+            response["stderr"] = deduped
         response["error"] = msg
     return response
 
@@ -221,11 +279,76 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int) -> dict
         )
 
 
+def _cursor_config_dir(cwd: str | None = None) -> Path:
+    """The directory cursor-agent writes its CLI config (cli-config.json) into.
+
+    ``CURSOR_CONFIG_DIR`` is honoured (verified empirically: setting it
+    redirects where cursor-agent writes cli-config.json). It reaches the child
+    by ordinary ``os.environ`` inheritance — ``_build_cursor_args`` only
+    explicitly forwards ``CURSOR_API_KEY`` — so this probe and the spawned CLI
+    read the same value as long as ``execute_agent`` keeps merging os.environ
+    into the child env rather than replacing it. A *relative* override is
+    resolved against ``cwd`` (cursor-agent's working dir, where it resolves the
+    same relative path) so the probe target matches the real write target.
+    """
+    override = os.environ.get("CURSOR_CONFIG_DIR")
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute() and cwd:
+            path = Path(cwd) / path
+        return path
+    return Path(os.path.expanduser("~")) / ".cursor"
+
+
+def _probe_writable(path: Path) -> bool:
+    """Return True only if ``path`` can actually be created and written to.
+
+    Uses a real mkdir + temp-file write rather than ``os.access(W_OK)``: under a
+    macOS seatbelt sandbox the denial is a MAC restriction, which ``access(2)``
+    (DAC-only) does not see — it would falsely report the dir as writable. An
+    actual write attempt is the only reliable probe for the sandboxed case this
+    preflight exists to catch.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=path, prefix=".preflight-"):
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def _preflight(inv: AgentInvocation) -> str | None:
+    """Return an actionable error message if the environment can't run the CLI.
+
+    Currently cursor-agent-specific: it refuses to start when its config dir is
+    not writable, crashing late with a wall of repeated cert warnings followed
+    by a buried ``EPERM ... cli-config.json.tmp``. Catch it up front instead.
+    """
+    if inv.cli != "cursor-agent":
+        return None
+    config_dir = _cursor_config_dir(inv.cwd)
+    if _probe_writable(config_dir):
+        return None
+    return (
+        f"cursor config dir not writable: {config_dir} — cursor-agent writes "
+        "cli-config.json here and cannot start without write access. Allow this "
+        "path in the sandbox, or set CURSOR_CONFIG_DIR to a writable location."
+    )
+
+
 def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000) -> dict:
     """Execute agent CLI for the given invocation. Returns a response dict.
 
-    Response shape: ``{result, exit_code, status, cli, error?}``.
+    Response shape: ``{result, exit_code, status, cli, error?, root_cause?,
+    stderr?}``. ``root_cause`` / ``stderr`` are best-effort and only populated
+    on the normal-exit error branch (``build_final_response``); preflight,
+    timeout, stdout-cap and spawn-error paths carry just ``error``.
     """
+    preflight_error = _preflight(inv)
+    if preflight_error:
+        return _error_response(inv.cli, _PREFLIGHT_EXIT_CODE, preflight_error)
+
     command, args, env_override = build_invocation_args(inv)
     proc_env = {**os.environ, **env_override} if env_override else None
 

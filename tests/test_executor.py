@@ -14,7 +14,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from _builder import AgentInvocation
-from _executor import build_final_response, execute_agent
+from _executor import (
+    _cursor_config_dir,
+    _probe_writable,
+    _summarize_stderr,
+    build_final_response,
+    execute_agent,
+)
 from run_subagent import main
 
 
@@ -72,6 +78,22 @@ class TestBuildFinalResponse:
         assert r["error"] == "CLI exited with code 1: boom"
         # When parsing failed, raw stdout falls into result for debugging
         assert r["result"] == "raw line\n"
+
+    def test_repeated_stderr_collapses_and_root_cause_leads(self):
+        # cursor-agent's real failure shape: many identical cert warnings,
+        # then the one actionable EPERM line buried at the very end.
+        stderr = (
+            "failed to copy trust settings of system certificate\n" * 18
+            + "Error: EPERM: operation not permitted, open '~/.cursor/cli-config.json.tmp'"
+        )
+        r = build_final_response("cursor-agent", 1, None, [], stderr)
+        assert r["status"] == "error"
+        # The actionable cause leads the error message, not the spam.
+        assert r["error"].startswith("CLI exited with code 1: Error: EPERM")
+        assert r["root_cause"].startswith("Error: EPERM")
+        # Full stderr is preserved but the 18 duplicates are collapsed to one.
+        assert "(×18)" in r["stderr"]
+        assert r["stderr"].count("failed to copy trust settings") == 1
 
 
 class TestExecuteAgent:
@@ -373,3 +395,118 @@ class TestMainEndToEnd:
             payload = json.loads(buf.getvalue().strip())
             assert exc_info.value.code == 0
             assert payload["agents"] == [{"name": "a", "description": "one."}]
+
+
+class TestSummarizeStderr:
+    def test_empty(self):
+        assert _summarize_stderr("") == ("", None)
+        assert _summarize_stderr("   \n  \n") == ("", None)
+
+    def test_collapses_consecutive_duplicates(self):
+        deduped, cause = _summarize_stderr("warn\nwarn\nwarn\nError: boom")
+        assert deduped == "warn (×3)\nError: boom"
+        assert cause == "Error: boom"
+
+    def test_root_cause_prefers_last_error_line(self):
+        _, cause = _summarize_stderr("Error: first\nnoise\nError: last\ntrailing note")
+        assert cause == "Error: last"
+
+    def test_root_cause_falls_back_to_last_line_when_no_marker(self):
+        _, cause = _summarize_stderr("just a note\nanother note")
+        assert cause == "another note"
+
+
+class TestCursorPreflight:
+    def test_blocks_when_cursor_config_dir_not_writable(self, tmp_path, monkeypatch):
+        readonly = tmp_path / "cursor-home"
+        readonly.mkdir()
+        monkeypatch.setenv("CURSOR_CONFIG_DIR", str(readonly))
+        # Simulate a sandbox/permission denial on any write into the dir.
+        with patch("_executor._probe_writable", return_value=False):
+            with patch("subprocess.Popen") as mock_popen:
+                result = execute_agent(
+                    AgentInvocation(cli="cursor-agent", prompt="echo hi", cwd=str(tmp_path)),
+                    timeout_ms=5000,
+                )
+        # Fails fast: never spawns the CLI, returns an actionable error.
+        mock_popen.assert_not_called()
+        assert result["status"] == "error"
+        assert result["exit_code"] == 126
+        assert "not writable" in result["error"]
+        assert "CURSOR_CONFIG_DIR" in result["error"]
+
+    def test_allows_when_cursor_config_dir_writable(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CURSOR_CONFIG_DIR", str(tmp_path / "writable-cursor"))
+        mock_process = MagicMock()
+        mock_process.stdout.readline.return_value = ""
+        mock_process.communicate.return_value = ("", "")
+        mock_process.returncode = 0
+        with patch("subprocess.Popen", return_value=mock_process) as mock_popen:
+            execute_agent(
+                AgentInvocation(cli="cursor-agent", prompt="echo hi", cwd=str(tmp_path)),
+                timeout_ms=5000,
+            )
+        # A writable (auto-created) config dir lets the spawn proceed.
+        mock_popen.assert_called_once()
+
+    def test_no_preflight_for_non_cursor_clis(self, tmp_path, monkeypatch):
+        # Even with an unwritable cursor dir, other CLIs must not be gated by it.
+        monkeypatch.setenv("CURSOR_CONFIG_DIR", str(tmp_path / "nope"))
+        mock_process = MagicMock()
+        mock_process.stdout.readline.return_value = ""
+        mock_process.communicate.return_value = ("", "")
+        mock_process.returncode = 0
+        with patch("_executor._probe_writable", return_value=False):
+            with patch("subprocess.Popen", return_value=mock_process) as mock_popen:
+                execute_agent(
+                    AgentInvocation(cli="codex", prompt="x", cwd=str(tmp_path)),
+                    timeout_ms=5000,
+                )
+        mock_popen.assert_called_once()
+
+
+class TestProbeWritable:
+    """Exercise the REAL probe — not a mock — so the core of the preflight is covered."""
+
+    def test_writable_dir_passes_and_leaves_no_residue(self, tmp_path):
+        target = tmp_path / "cursor-cfg"
+        assert _probe_writable(target) is True
+        assert target.is_dir()  # auto-created
+        assert list(target.iterdir()) == []  # temp probe file cleaned up
+
+    def test_readonly_dir_is_detected_as_unwritable(self, tmp_path):
+        # The whole reason _probe_writable does a real write instead of
+        # os.access: it must report a non-writable dir as such. (Skip as root /
+        # on Windows, where 0o500 does not deny the owner a write.)
+        if sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+            pytest.skip("POSIX non-root only: chmod write-deny does not apply")
+        ro = tmp_path / "ro"
+        ro.mkdir()
+        ro.chmod(0o500)
+        try:
+            assert _probe_writable(ro) is False
+        finally:
+            ro.chmod(0o700)  # restore so pytest can clean up tmp_path
+
+    def test_path_occupied_by_a_file_is_unwritable(self, tmp_path):
+        # mkdir(exist_ok=True) raises FileExistsError (an OSError) → False.
+        clash = tmp_path / "afile"
+        clash.write_text("x")
+        assert _probe_writable(clash) is False
+
+
+class TestCursorConfigDir:
+    def test_default_is_home_dot_cursor(self, monkeypatch):
+        monkeypatch.delenv("CURSOR_CONFIG_DIR", raising=False)
+        assert _cursor_config_dir() == Path(os.path.expanduser("~")) / ".cursor"
+
+    def test_absolute_override_used_verbatim(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CURSOR_CONFIG_DIR", str(tmp_path / "x"))
+        assert _cursor_config_dir(cwd="/some/cwd") == tmp_path / "x"
+
+    def test_relative_override_resolved_against_cwd(self, monkeypatch):
+        # cursor-agent resolves a relative CURSOR_CONFIG_DIR against its own cwd
+        # (= the spawn cwd); the probe must target the same place, not the
+        # broker's cwd.
+        monkeypatch.setenv("CURSOR_CONFIG_DIR", "relcfg")
+        assert _cursor_config_dir(cwd="/work/dir") == Path("/work/dir/relcfg")

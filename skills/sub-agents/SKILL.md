@@ -91,6 +91,8 @@ Parse JSON output and check `status` field:
 {"result": "...", "exit_code": 0, "status": "success", "cli": "claude"}
 ```
 
+On `status: "error"` the envelope may carry two extra optional fields (best-effort, only on the normal-exit error path): `root_cause` — the single actionable error line extracted from the CLI's stderr (so callers can branch on the real failure instead of parsing noise); and `stderr` — the full stderr with repeated lines collapsed (e.g. `... (×18)`) for debugging.
+
 **By status:**
 
 | status | Meaning | Action |
@@ -105,6 +107,7 @@ Parse JSON output and check `status` field:
 |-----------|---------|------------|
 | 0 | Success | - |
 | 124 | Timeout | Increase `--timeout` or simplify task |
+| 126 | Environment preflight failed (e.g. cursor config dir not writable) | Allow the path to be written, or set `CURSOR_CONFIG_DIR` to a writable location |
 | 127 | CLI not found | Install required CLI (claude, codex, etc.) |
 | 1 | General error | Check `error` field in response |
 

@@ -318,6 +318,8 @@ Make sure the CLI is properly installed and accessible.
 **If using Cursor CLI:**
 Run `cursor-agent login` to authenticate. Sessions can expire, so just run this command again if you see auth errors.
 
+`cursor-agent` needs a **writable config directory** (`~/.cursor` by default, or `$CURSOR_CONFIG_DIR`) — it writes `cli-config.json` there on every start and crashes without write access. In a restricted sandbox (e.g. a Claude Code / Codex sub-agent shell whose filesystem is locked down), either allow `~/.cursor` to be written or point `CURSOR_CONFIG_DIR` at a writable path. `run_subagent.py` preflights this and fails fast with `exit_code: 126` and an actionable error instead of letting cursor crash with a wall of cert warnings.
+
 **If using Gemini CLI:**
 Set `GEMINI_API_KEY` in the environment — without it the `gemini` backend won't run (Google is retiring the free OAuth tier on June 18, 2026).
 
